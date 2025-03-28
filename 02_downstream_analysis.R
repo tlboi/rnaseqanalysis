@@ -1,0 +1,405 @@
+# Downstream Analysis: Volcano Plots, GO Enrichment, and Heatmaps
+
+# --- 1. Setup ---
+
+# Libraries
+library(tidyverse)
+library(scales)          # For number formatting
+library(clusterProfiler) # For GO analysis
+library(org.Hs.eg.db)    # For GO gene annotations
+library(AnnotationDbi)   # For mapIds
+library(parallel)        # For mclapply
+library(ggrepel)         # For volcano plot labels
+library(ggplot2)
+library(pheatmap)        # For heatmaps
+library(DESeq2)          # To load DESeqDataSet object for counts/colData
+library(SummarizedExperiment) # To access rowData/colData
+
+
+# Parameters
+PADJ_THRESHOLD_VOLCANO <- 0.05   # Adj P-value threshold for volcano plot significance coloring/GO input
+LFC_THRESHOLD_VOLCANO <- 1.0     # Log2FC threshold for volcano plot significance coloring
+LFC_THRESHOLD_GO <- 0.0          # Log2FC threshold for selecting genes for GO analysis (0 means use Padj only)
+SMALL_P_VALUE <- 1e-300          # Smallest p-value allowed (prevent -Inf log10)
+TOP_N_LABEL <- 50                # Max number of genes to label on volcano plots (combined top DE & gene set)
+TEXT_SIZE_VOLCANO <- 3           # Base text size for volcano plots
+MAX_ITER_REPEL <- 20000          # Max iterations for ggrepel
+MAX_OVERLAPS_REPEL <- 15         # Max overlaps for ggrepel labels
+MIN_SIG_GENES_FOR_GO <- 10       # Minimum number of significant genes to run GO analysis
+NUM_GO_CATEGORIES_PLOT <- 20     # Number of GO categories to show on dotplot/heatmaps
+TOP_N_HEATMAP_PER_GO <- 50       # Number of top DE genes per GO category for heatmap
+
+N_CPU <- max(1, detectCores() - 1) # Number of cores for parallel processing
+
+# Input/Output Files and Directories
+results_dir <- "results"
+downstream_results_base_dir <- file.path(results_dir, "downstream_analysis")
+pairwise_csv_dir <- file.path(results_dir, "pairwise_results") # Directory containing CSVs from script 1
+gene_set_data_dir <- "data/gene_sets" # Directory containing gene set files
+
+# Files saved by script 01
+deseq2_object_file <- file.path(results_dir, "deseq2_object.RData") # Contains 'dds'
+deseq2_reslist_file <- file.path(results_dir, "deseq2_reslist.RData") # Contains 'vsd'
+
+# Gene set file (list of gene symbols, one per line)
+gene_set_interest_file <- file.path(gene_set_data_dir, "Genes_of_interest.txt")
+
+# Create base output directory
+dir.create(downstream_results_base_dir, showWarnings = FALSE)
+
+
+# --- 2. Load Data and Gene Set ---
+
+# Load DESeq2 object ('dds') and VST object ('vsd')
+if(file.exists(deseq2_object_file)) {
+  load(deseq2_object_file) # Loads 'dds'
+  cat("Loaded DESeqDataSet 'dds' from:", deseq2_object_file, "\n")
+} else {
+  stop("DESeq2 object file not found:", deseq2_object_file)
+}
+if(file.exists(deseq2_reslist_file)) {
+  load(deseq2_reslist_file) # Loads 'vsd' (and others, we mainly need vsd here)
+  cat("Loaded VST object 'vsd' from:", deseq2_reslist_file, "\n")
+} else {
+  # Optionally, recalculate vsd if the file is missing
+  # vsd <- vst(dds, blind = TRUE)
+  # cat("Recalculated VST object 'vsd'.\n")
+  stop("VST object file not found:", deseq2_reslist_file)
+}
+
+# Load gene set of interest
+if (file.exists(gene_set_interest_file)) {
+  gene_set_interest <- readLines(gene_set_interest_file)
+  gene_set_interest <- gene_set_interest[gene_set_interest != ""] # Remove empty lines
+  cat("Loaded", length(gene_set_interest), "genes of interest from:", gene_set_interest_file, "\n")
+} else {
+  cat("Warning: Gene set file not found:", gene_set_interest_file, ". No genes will be specifically highlighted.\n")
+  gene_set_interest <- c()
+}
+
+# Extract necessary info from loaded objects
+norm_counts <- counts(dds, normalized = TRUE)
+coldata_anno <- as.data.frame(colData(dds)[, c("CellLine", "Time", "Treatment")]) # For heatmap annotation
+
+# Get mapping from GeneID (rownames) to Symbol (if needed)
+# Assuming rownames are Ensembl IDs and rowData has a Symbol column
+if (!"Symbol" %in% colnames(rowData(dds))) {
+  stop("Required column 'Symbol' not found in rowData(dds). Cannot map IDs to Symbols.")
+}
+gene_id_to_symbol_map <- setNames(rowData(dds)$Symbol, rownames(dds))
+
+
+# --- 3. Define Processing Function for Each Comparison ---
+
+# Function to create comparison-specific output directory
+create_comparison_dir <- function(comparison_name, base_dir) {
+  # Sanitize comparison name for directory creation
+  safe_comp_name <- gsub("[^a-zA-Z0-9_.-]", "_", comparison_name)
+  dir_name <- file.path(base_dir, safe_comp_name)
+  if (!dir.exists(dir_name)) {
+    dir.create(dir_name, recursive = TRUE, showWarnings = FALSE)
+  }
+  return(dir_name)
+}
+
+
+# Main function to process one CSV file
+process_comparison_csv <- function(csv_file) {
+  comparison_name <- gsub("\\.csv$", "", basename(csv_file))
+  cat("Processing:", comparison_name, "\n")
+  
+  # Create output directory for this comparison
+  current_results_dir <- create_comparison_dir(comparison_name, downstream_results_base_dir)
+  
+  # Read the results CSV generated by script 1
+  df <- tryCatch({
+    read.csv(csv_file, row.names = 1) # Assuming first column is GeneID (rownames)
+  }, error = function(e) {
+    cat("Error reading CSV:", csv_file, "\n", e$message, "\n")
+    return(NULL)
+  })
+  if(is.null(df)) return(NULL) # Skip if file reading failed
+  
+  # Ensure required columns exist
+  req_cols_volcano <- c("log2FoldChange", "padj", "Symbol")
+  if (!all(req_cols_volcano %in% colnames(df))) {
+    cat("Skipping Volcano/GO for", comparison_name, "- Missing required columns:",
+        paste(setdiff(req_cols_volcano, colnames(df)), collapse=", "), "\n")
+    return(comparison_name) # Return name even if skipped downstream
+  }
+  
+  # --- 3a. Volcano Plot ---
+  cat("  Generating Volcano Plot...\n")
+  
+  # Handle potential NA/zero p-values
+  df <- df %>%
+    filter(!is.na(padj), !is.na(log2FoldChange)) %>%
+    mutate(padj = ifelse(padj < SMALL_P_VALUE, SMALL_P_VALUE, padj),
+           log10_padj = -log10(padj))
+  
+  # Determine plot limits and breaks dynamically
+  y_max <- max(df$log10_padj[is.finite(df$log10_padj)], 10, na.rm = TRUE) # Ensure y_max is at least 10
+  y_break_interval <- case_when(
+    y_max <= 10 ~ 1,
+    y_max <= 50 ~ 5,
+    y_max <= 150 ~ 10,
+    TRUE ~ 50
+  )
+  x_lim_val <- max(abs(df$log2FoldChange), LFC_THRESHOLD_VOLCANO + 1, na.rm = TRUE) * 1.05 # Dynamic x-lim with buffer
+  
+  # Identify genes to label: top N DE genes + genes of interest that are significant
+  df_sig <- df %>% filter(padj < PADJ_THRESHOLD_VOLCANO & abs(log2FoldChange) > LFC_THRESHOLD_VOLCANO)
+  
+  # Genes of interest that are significant
+  sig_interest_genes <- df_sig %>%
+    filter(Symbol %in% gene_set_interest) %>%
+    arrange(padj) # Prioritize most significant among interest set
+  
+  # Top DE genes (excluding those already selected from interest set)
+  top_de_genes <- df_sig %>%
+    filter(!Symbol %in% sig_interest_genes$Symbol) %>%
+    arrange(padj) # Order by significance
+  
+  # Combine, ensuring unique symbols and respecting TOP_N_LABEL limit
+  num_interest_labels = min(nrow(sig_interest_genes), floor(TOP_N_LABEL / 2))
+  num_de_labels = TOP_N_LABEL - num_interest_labels
+  label_symbols <- unique(c(head(sig_interest_genes$Symbol, num_interest_labels),
+                            head(top_de_genes$Symbol, num_de_labels)))
+  label_symbols <- label_symbols[!is.na(label_symbols) & !grepl("ENSG", label_symbols) & !grepl("ERCC", label_symbols)] # Filter labels
+  
+  # Get data subset for labeling
+  label_data <- df %>% filter(Symbol %in% label_symbols)
+  
+  # Add significance status for coloring
+  df <- df %>%
+    mutate(significance = case_when(
+      padj < PADJ_THRESHOLD_VOLCANO & log2FoldChange > LFC_THRESHOLD_VOLCANO ~ paste("Up (|LFC|>", LFC_THRESHOLD_VOLCANO, ")"),
+      padj < PADJ_THRESHOLD_VOLCANO & log2FoldChange < -LFC_THRESHOLD_VOLCANO ~ paste("Down (|LFC|>", LFC_THRESHOLD_VOLCANO, ")"),
+      TRUE ~ "Not Significant"
+    ),
+    significance = factor(significance, levels = c(paste("Up (|LFC|>", LFC_THRESHOLD_VOLCANO, ")"),
+                                                   "Not Significant",
+                                                   paste("Down (|LFC|>", LFC_THRESHOLD_VOLCANO, ")"))))
+  
+  # Define colors (adjust if levels change)
+  volcano_colors <- c("red", "grey", "blue")
+  names(volcano_colors) <- levels(df$significance)
+  
+  # Create the plot
+  volcano_plot <- ggplot(df, aes(x = log2FoldChange, y = log10_padj)) +
+    geom_point(aes(color = significance), size = 0.5 * TEXT_SIZE_VOLCANO, alpha = 0.7) +
+    geom_text_repel(data = label_data,
+                    aes(label = Symbol,
+                        fontface = ifelse(Symbol %in% gene_set_interest, 'bold', 'plain')),
+                    size = TEXT_SIZE_VOLCANO * 0.8,
+                    box.padding = unit(0.15, "lines"),
+                    point.padding = unit(0.15, "lines"),
+                    segment.color = 'grey50',
+                    segment.size = 0.2,
+                    max.iter = MAX_ITER_REPEL,
+                    force = 5,
+                    max.overlaps = MAX_OVERLAPS_REPEL) + # Use parameter
+    coord_cartesian(xlim = c(-x_lim_val, x_lim_val)) +
+    scale_y_continuous(breaks = seq(0, ceiling(y_max), by = y_break_interval),
+                       labels = scales::number_format(scale = 1)) +
+    scale_color_manual(name = NULL, values = volcano_colors) +
+    labs(title = paste("Volcano Plot:", comparison_name),
+         subtitle = paste("|Log2FC| >", LFC_THRESHOLD_VOLCANO, "& Adj. P <", PADJ_THRESHOLD_VOLCANO),
+         x = "Log2 Fold Change",
+         y = "-Log10 Adjusted P-value") +
+    theme_bw(base_size = 10) + # Adjust base size if needed
+    theme(legend.position = "bottom",
+          # legend.justification = c(1, 1),
+          # legend.box.just = "right",
+          # legend.margin = margin(2, 2, 2, 2),
+          plot.title = element_text(size = rel(1.2), hjust = 0.5),
+          plot.subtitle = element_text(size = rel(1.0), hjust = 0.5),
+          axis.title = element_text(size = rel(1.1)),
+          legend.text = element_text(size = rel(0.9))) +
+    # legend.background = element_blank(),
+    # legend.key = element_blank(),
+    # legend.key.size = unit(0.8, "lines")) +
+    # Add annotations about labeled genes
+    annotate("text", x = -x_lim_val * 0.95, y = y_max * 0.98, hjust = 0, vjust = 1, size = TEXT_SIZE_VOLCANO * 0.8,
+             label = paste("Labeled 'Gene Set':", sum(label_data$Symbol %in% gene_set_interest))) +
+    annotate("text", x = -x_lim_val * 0.95, y = y_max * 0.93, hjust = 0, vjust = 1, size = TEXT_SIZE_VOLCANO * 0.8,
+             label = paste("Labeled 'Top DE':", sum(!label_data$Symbol %in% gene_set_interest)))
+  
+  # Save the plot
+  volcano_filename <- file.path(current_results_dir, paste0(
+    "Volcano_plot_", comparison_name,
+    "_log2FC_", LFC_THRESHOLD_VOLCANO,
+    "_padj_", PADJ_THRESHOLD_VOLCANO, ".pdf"))
+  ggsave(filename = volcano_filename, plot = volcano_plot, device = "pdf", height = 8, width = 7)
+  
+  
+  # --- 3b. GO Enrichment Analysis ---
+  cat("  Running GO Enrichment Analysis...\n")
+  
+  # Extract significant gene symbols for GO based on LFC_THRESHOLD_GO
+  sig_gene_symbols_go <- df %>%
+    filter(padj < PADJ_THRESHOLD_VOLCANO & abs(log2FoldChange) > LFC_THRESHOLD_GO) %>%
+    pull(Symbol) %>%
+    unique()
+  
+  # Define the background universe (all genes with non-NA padj in the comparison)
+  universe_symbols <- df %>% pull(Symbol) %>% unique()
+  
+  if (length(sig_gene_symbols_go) < MIN_SIG_GENES_FOR_GO) {
+    cat("  Warning: Skipping GO analysis for", comparison_name, "- fewer than", MIN_SIG_GENES_FOR_GO, "significant genes (|LFC|>", LFC_THRESHOLD_GO, ").\n")
+  } else {
+    go_results <- tryCatch({
+      enrichGO(gene = sig_gene_symbols_go,
+               universe = universe_symbols,
+               OrgDb = org.Hs.eg.db,
+               keyType = "SYMBOL",
+               ont = "BP", # Focus on Biological Process? Or use "ALL"? Let's use BP for focus.
+               pAdjustMethod = "BH",
+               pvalueCutoff = 0.05, # Use p.adjust cutoff in enrichGO
+               qvalueCutoff = 0.2)   # qvalue cutoff
+    }, error = function(e) {
+      cat("  Error during GO enrichment for", comparison_name, ":", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(go_results) && nrow(go_results@result) > 0) {
+      # Simplify results to remove redundancy (optional)
+      # go_results_simple <- clusterProfiler::simplify(go_results, cutoff=0.7, by="p.adjust", select_fun=min)
+      # Using original results for now
+      
+      # Save GO results table
+      go_res_df <- as.data.frame(go_results)
+      go_table_filename <- file.path(current_results_dir, paste0("GO_BP_enrichment_", comparison_name, ".tsv"))
+      write.table(go_res_df, file = go_table_filename, sep = "\t", quote = FALSE, row.names = FALSE)
+      cat("  Saved GO results table to:", go_table_filename, "\n")
+      
+      # Plot GO results dot plot
+      num_go_to_show <- min(NUM_GO_CATEGORIES_PLOT, nrow(go_results@result))
+      if (num_go_to_show > 0) {
+        go_plot_title <- paste("GO Enrichment (BP):", comparison_name)
+        go_dot_plot <- dotplot(go_results, showCategory = num_go_to_show, font.size=10) + ggtitle(go_plot_title)
+        
+        go_plot_filename <- file.path(current_results_dir, paste0("GO_BP_dotplot_", comparison_name, ".pdf"))
+        ggsave(go_plot_filename, plot = go_dot_plot, width = 10, height = max(6, num_go_to_show * 0.4)) # Adjust height dynamically
+        cat("  Saved GO dot plot to:", go_plot_filename, "\n")
+        
+        # --- 3c. Heatmaps for Top GO Categories ---
+        cat("  Generating heatmaps for top", num_go_to_show, "GO categories...\n")
+        
+        # Prepare annotation colors
+        ann_colors_heatmap <- list(
+          Time = RColorBrewer::brewer.pal(length(levels(coldata_anno$Time)), "BuPu"),
+          CellLine = RColorBrewer::brewer.pal(length(levels(coldata_anno$CellLine)), "Accent"),
+          Treatment = c("grey", "black")[1:length(levels(coldata_anno$Treatment))]
+        )
+        names(ann_colors_heatmap$Time) <- levels(coldata_anno$Time)
+        names(ann_colors_heatmap$CellLine) <- levels(coldata_anno$CellLine)
+        names(ann_colors_heatmap$Treatment) <- levels(coldata_anno$Treatment)
+        
+        for (i in 1:num_go_to_show) {
+          go_term_id <- go_results@result[i, ]$ID
+          go_term_desc <- go_results@result[i, ]$Description
+          genes_in_category_symbols <- unlist(strsplit(go_results@result[i, ]$geneID, "/"))
+          
+          # Get the corresponding Gene IDs (e.g., Ensembl) for these symbols
+          # Need the original df which has GeneID (rownames) and Symbol mapping
+          # Or use the gene_id_to_symbol_map created earlier
+          gene_ids_in_category <- names(gene_id_to_symbol_map)[gene_id_to_symbol_map %in% genes_in_category_symbols]
+          gene_ids_in_category <- intersect(gene_ids_in_category, rownames(norm_counts)) # Ensure they exist in count matrix
+          
+          if (length(gene_ids_in_category) == 0) {
+            cat("    Skipping heatmap for GO:", go_term_desc, "- No matching genes found in count matrix.\n")
+            next
+          }
+          
+          # Subset normalized counts (using VST data is often better for heatmaps)
+          # Use assay(vsd) instead of norm_counts
+          heatmap_data_all <- assay(vsd)[gene_ids_in_category, , drop = FALSE]
+          
+          # Subset to top N DE genes within this category *for this comparison*
+          df_subset_go <- df %>% filter(Symbol %in% genes_in_category_symbols) %>% arrange(padj)
+          top_symbols_for_heatmap <- head(df_subset_go$Symbol, TOP_N_HEATMAP_PER_GO)
+          top_gene_ids_for_heatmap <- names(gene_id_to_symbol_map)[gene_id_to_symbol_map %in% top_symbols_for_heatmap]
+          top_gene_ids_for_heatmap <- intersect(top_gene_ids_for_heatmap, gene_ids_in_category)
+          
+          if(length(top_gene_ids_for_heatmap) < 2) {
+            cat("    Skipping Top N heatmap for GO:", go_term_desc, "- Fewer than 2 top DE genes found.\n")
+          } else {
+            heatmap_data_top_n <- assay(vsd)[top_gene_ids_for_heatmap, , drop = FALSE]
+            heatmap_title_top_n <- paste(comparison_name, "\nTop", nrow(heatmap_data_top_n), "DE Genes in:", go_term_desc, "(Rank", i, ")")
+            
+            # Sanitize filename
+            safe_go_desc <- make.names(substr(go_term_desc, 1, 50)) # Limit length
+            heatmap_file_top_n <- file.path(current_results_dir, paste0("heatmap_GO_Rank", i, "_", safe_go_desc, "_Top", TOP_N_HEATMAP_PER_GO, ".pdf"))
+            
+            # Generate heatmap for Top N
+            pheatmap(heatmap_data_top_n,
+                     show_rownames = nrow(heatmap_data_top_n) <= 50, # Show if not too many
+                     show_colnames = ncol(heatmap_data_top_n) <= 30,
+                     scale = "row",
+                     cluster_cols = FALSE,
+                     annotation_col = coldata_anno,
+                     annotation_colors = ann_colors_heatmap,
+                     main = heatmap_title_top_n,
+                     fontsize_row = 8,
+                     filename = heatmap_file_top_n,
+                     width = 8, height = max(6, nrow(heatmap_data_top_n) * 0.15 + 2)) # Dynamic height
+          }
+          
+          # Heatmap for *all* significant genes in the category
+          if(nrow(heatmap_data_all) < 2) {
+            cat("    Skipping 'All Genes' heatmap for GO:", go_term_desc, "- Fewer than 2 genes found.\n")
+          } else {
+            heatmap_title_all <- paste(comparison_name, "\nAll", nrow(heatmap_data_all), "Genes in:", go_term_desc, "(Rank", i, ")")
+            safe_go_desc <- make.names(substr(go_term_desc, 1, 50))
+            heatmap_file_all <- file.path(current_results_dir, paste0("heatmap_GO_Rank", i, "_", safe_go_desc, "_AllGenes.pdf"))
+            
+            pheatmap(heatmap_data_all,
+                     show_rownames = nrow(heatmap_data_all) <= 75,
+                     show_colnames = ncol(heatmap_data_all) <= 30,
+                     scale = "row",
+                     cluster_cols = FALSE,
+                     annotation_col = coldata_anno,
+                     annotation_colors = ann_colors_heatmap,
+                     main = heatmap_title_all,
+                     fontsize_row = 6,
+                     filename = heatmap_file_all,
+                     width = 8, height = max(6, nrow(heatmap_data_all) * 0.1 + 2))
+          }
+        } # End loop through GO categories
+      } else {
+        cat("  No significant GO terms found to plot/heatmap for", comparison_name, "\n")
+      }
+    } else {
+      cat("  GO enrichment analysis yielded no significant results for", comparison_name, "\n")
+    }
+  } # End GO analysis block
+  
+  return(comparison_name) # Return the name of the processed comparison
+}
+
+
+# --- 4. Run Processing in Parallel ---
+
+# List all CSV files from script 1 output
+csv_files <- list.files(pairwise_csv_dir, pattern = "\\.csv$", full.names = TRUE)
+cat("\nFound", length(csv_files), "comparison CSV files in:", pairwise_csv_dir, "\n")
+
+if(length(csv_files) > 0) {
+  cat("Starting downstream analysis using", N_CPU, "cores...\n")
+  # Use mclapply for parallel processing
+  processed_comparisons <- mclapply(csv_files, process_comparison_csv, mc.cores = N_CPU)
+  
+  # Check for errors (NULLs returned by the function)
+  num_failed <- sum(sapply(processed_comparisons, is.null))
+  if(num_failed > 0) {
+    cat("Warning:", num_failed, "comparisons failed during processing.\n")
+  }
+  cat("Finished processing", length(processed_comparisons) - num_failed, "comparisons.\n")
+  
+} else {
+  cat("No CSV files found to process in:", pairwise_csv_dir, "\n")
+}
+
+cat("--- Downstream Analysis Script Finished ---\n")
+
